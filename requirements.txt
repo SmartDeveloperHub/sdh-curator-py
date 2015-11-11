@@ -1,0 +1,4 @@
+nose
+rdflib
+futures
+pika
