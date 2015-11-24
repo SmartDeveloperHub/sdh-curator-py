@@ -21,25 +21,40 @@
   limitations under the License.
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=#
 """
+import Queue
+import json
+from abc import abstractmethod, abstractproperty, ABCMeta
+from urlparse import urlparse
+from pika.exceptions import ChannelClosed
 
 __author__ = 'Fernando Serena'
 
 import StringIO
 
 import uuid
+import logging
+import pika
+from rdflib import Graph, RDF, Literal, BNode, URIRef
+from rdflib.namespace import Namespace, FOAF, XSD
+import re
+from agora.client.agora import Agora
+import time
+from threading import Thread
 from datetime import datetime
 
-import pika
-from rdflib import Graph, RDF, Literal, BNode
-from rdflib.namespace import Namespace, FOAF
-import re
+log = logging.getLogger('sdh.curator.client')
 
 CURATOR = Namespace('http://www.smartdeveloperhub.org/vocabulary/curator#')
 TYPES = Namespace('http://www.smartdeveloperhub.org/vocabulary/types#')
 AMQP = Namespace('http://www.smartdeveloperhub.org/vocabulary/amqp#')
 
+agora_client = Agora('http://localhost:9001')
+prefixes = agora_client.prefixes
 
 class RequestGraph(Graph):
+
+    __metaclass__ = ABCMeta
+
     def __init__(self):
         super(RequestGraph, self).__init__()
         self._request_node = BNode()
@@ -91,6 +106,10 @@ class RequestGraph(Graph):
     @property
     def message_id(self):
         return self._message_id
+
+    @abstractproperty
+    def type(self):
+        pass
 
     @message_id.setter
     def message_id(self, value):
@@ -160,56 +179,218 @@ class RequestGraph(Graph):
         self._broker_vh = Literal(value, datatype=TYPES.Path)
         self.set((self.broker_node, AMQP.virtualHost, self._broker_vh))
 
+    def transform(self, elem):
+        return elem
 
-class StreamRequestGraph(RequestGraph):
+
+class FragmentRequestGraph(RequestGraph):
+
+    __metaclass__ = ABCMeta
+
+    @staticmethod
+    def __is_variable(elm):
+        return elm.startswith('?')
+
+    @staticmethod
+    def __extend_uri(short):
+        """
+        Extend a prefixed uri with the help of a specific dictionary of prefixes
+        :param short: Prefixed uri to be extended
+        :return:
+        """
+        if short == 'a':
+            return RDF.type
+        for prefix in sorted(prefixes, key=lambda x: len(x), reverse=True):
+            if short.startswith(prefix):
+                return URIRef(short.replace(prefix + ':', prefixes[prefix]))
+        return short
+
+    @staticmethod
+    def is_uri(uri):
+        if uri.startswith('<') and uri.endswith('>'):
+            uri = uri.lstrip('<').rstrip('>')
+            parse = urlparse(uri, allow_fragments=True)
+            return bool(len(parse.scheme))
+        elif ':' in uri:
+            prefix_parts = uri.split(':')
+            return len(prefix_parts) == 2 and prefix_parts[0] in prefixes
+
+        return uri == 'a'
+
     def __init__(self, *args):
-        super(StreamRequestGraph, self).__init__()
-        self.add((self.request_node, RDF.type, CURATOR.StreamRequest))
+        super(FragmentRequestGraph, self).__init__()
         if not args:
             raise AttributeError('A graph pattern must be provided')
 
+        elements = {}
+
         for tp in args:
-            s, p, o = tuple(tp.split(' '))
-            # if s.startswith('?'):
+            s, p, o = tuple(tp.strip().split(' '))
+            if s not in elements:
+                if self.__is_variable(s):
+                    elements[s] = BNode(s)
+                    self.set((elements[s], RDF.type, CURATOR.Variable))
+                    self.set((elements[s], CURATOR.label, Literal(s, datatype=XSD.string)))
+            if p not in elements:
+                if self.is_uri(p):
+                    elements[p] = self.__extend_uri(p)
+            if o not in elements:
+                if self.__is_variable(o):
+                    elements[o] = BNode(o)
+                    self.set((elements[o], RDF.type, CURATOR.Variable))
+                    self.set((elements[o], CURATOR.label, Literal(o, datatype=XSD.string)))
+                elif self.is_uri(o):
+                    elements[o] = self.__extend_uri(o)
+                else:
+                    elements[o] = Literal(o)
+
+            self.add((elements[s], elements[p], elements[o]))
 
 
+class StreamRequestGraph(FragmentRequestGraph):
+    def __init__(self, *args):
+        super(StreamRequestGraph, self).__init__(*args)
+        self.add((self.request_node, RDF.type, CURATOR.StreamRequest))
+
+    @property
+    def type(self):
+        return 'stream'
+
+    def transform(self, quad):
+        def __transform(x):
+            if type(x) == str or type(x) == unicode:
+                if StreamRequestGraph.is_uri(x):
+                    return URIRef(x.lstrip('<').rstrip('>'))
+                else:
+                    value, ty = tuple(x.split('^^'))
+                    return Literal(value.replace('"', ''), datatype=URIRef(ty.lstrip('<').rstrip('>')))
+            return x
+
+        triple = quad[1:]
+        return tuple([quad[0]] + map(__transform, triple))
+
+
+class QueryRequestGraph(FragmentRequestGraph):
+    def __init__(self, *args):
+        super(QueryRequestGraph, self).__init__(*args)
+        self.add((self.request_node, RDF.type, CURATOR.QueryRequest))
+
+    @property
+    def type(self):
+        return 'query'
 
 
 class CuratorClient(object):
-    def __init__(self, host='localhost', port=5672):
+    def __init__(self, host='localhost', port=5672, wait=False, monitoring=None):
         self.__host = host
         self.__port = port
         self.__connection = pika.BlockingConnection(pika.ConnectionParameters(host=host, port=port))
         self.__channel = self.__connection.channel()
+        self.__listening = False
+        self.__accept_queue = self.__response_queue = None
+        self.__monitor = Thread(target=self.__monitor_consume, args=[monitoring]) if monitoring else None
+        self.__last_consume = datetime.now()
+        self.__keep_monitoring = True
+        self.__accepted = False
+        self.__message = None
+        self.__wait = wait
 
-    def request(self, message, callback):
-        def __accept_callback(ch, method, properties, body):
-            g = Graph()
-            g.parse(StringIO.StringIO(body), format='turtle')
-            print g.serialize(format='turtle')
-            if len(list(g.subjects(RDF.type, CURATOR.Accepted))) == 1:
-                print 'Request accepted!'
+    def __monitor_consume(self, t):
+        while self.__keep_monitoring:
+            if (datetime.now() - self.__last_consume).seconds > t:
+                self.stop()
+                break
             else:
-                print 'Bad request!'
+                time.sleep(1)
 
-        def __response_callback(ch, method, properties, body):
-            callback(body)
+    def request(self, message):
+        self.__response_queue = self.__channel.queue_declare(auto_delete=True).method.queue
+        message.routing_key = self.__response_queue
+        self.__message = message
 
-        response_queue = self.__channel.queue_declare(auto_delete=True).method.queue
-        message.routing_key = response_queue
-        self.__channel.basic_consume(__response_callback, queue=response_queue, no_ack=True)
-
-        accept_queue = self.__channel.queue_declare(exclusive=True).method.queue
-        self.__channel.queue_bind(exchange='sdh', queue=accept_queue,
+        self.__accept_queue = self.__channel.queue_declare(auto_delete=True).method.queue
+        self.__channel.queue_bind(exchange='sdh', queue=self.__accept_queue,
                                   routing_key='curator.response.{}'.format(str(message.agent_id)))
-        self.__channel.basic_consume(__accept_callback, queue=accept_queue, no_ack=True)
 
         self.__channel.basic_publish(exchange='sdh',
-                                     routing_key='curator.request.stream',
+                                     routing_key='curator.request.{}'.format(self.__message.type),
                                      body=message.serialize(format='turtle'))
+        self.__listening = True
+        return agora_client.prefixes, self.__consume()
 
-    def start(self):
-        self.__channel.start_consuming()
+    def __consume(self):
+        def __response_callback(properties, body):
+            if properties.headers.get('state', None) == 'end':
+                log.info('End of stream received!')
+                self.stop()
+            else:
+                try:
+                    items = json.loads(body)
+                except ValueError:
+                    items = eval(body)
+
+                if not isinstance(items, list):
+                    items = [items]
+                for item in items:
+                    yield properties.headers, item
+
+        try:
+            for message in self.__channel.consume(self.__accept_queue, no_ack=True, inactivity_timeout=1):
+                if message is not None:
+                    method, properties, body = message
+                    g = Graph()
+                    g.parse(StringIO.StringIO(body), format='turtle')
+                    print g.serialize(format='turtle')
+                    if len(list(g.subjects(RDF.type, CURATOR.Accepted))) == 1:
+                        print 'Request accepted!'
+                        self.__accepted = True
+                    else:
+                        print 'Bad request!'
+                    self.__channel.queue_delete(self.__accept_queue)
+                    self.__channel.cancel()
+                    break
+
+            if not self.__accepted:
+                return
+            if self.__monitor is not None:
+                self.__monitor.start()
+            for message in self.__channel.consume(self.__response_queue, no_ack=True, inactivity_timeout=1):
+                if message is not None:
+                    method, properties, body = message
+                    for headers, item in __response_callback(properties, body):
+                        yield headers, self.__message.transform(item)
+                elif not self.__wait:
+                    yield None
+                else:
+                    log.debug('Inactivity timeout...')
+                self.__last_consume = datetime.now()
+        except Exception, e:
+            print e.message
+        if self.__monitor is not None:
+            self.__keep_monitoring = False
+            self.__monitor.join()
 
     def stop(self):
-        self.__channel.stop_consuming()
+        try:
+            self.__channel.queue_delete(self.__accept_queue)
+            self.__channel.queue_delete(self.__response_queue)
+            self.__channel.cancel()
+            self.__channel.close()
+            self.__listening = False
+        except ChannelClosed:
+            pass
+
+    @property
+    def listening(self):
+        return self.__listening
+
+
+def get_fragment_generator(*args, **kwargs):
+    client = CuratorClient(**kwargs)
+    request = StreamRequestGraph(*args)
+    return client.request(request)
+
+def get_query_generator(*args, **kwargs):
+    client = CuratorClient(**kwargs)
+    request = QueryRequestGraph(*args)
+    return client.request(request)

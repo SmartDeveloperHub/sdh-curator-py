@@ -22,17 +22,15 @@
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=#
 """
 
-from sdh.curator.client import CuratorClient, StreamRequestGraph
+from sdh.curator.client import get_query_generator, get_fragment_generator
 
 __author__ = 'Fernando Serena'
 
+# prefixes, gen = get_query_generator('?s doap:developer ?d', '?d foaf:name ?n',
+#                               host='localhost', port=5672)
 
-client = CuratorClient()
-request = StreamRequestGraph('?s scm:hasBranch ?b')
+prefixes, gen = get_fragment_generator('?s doap:developer ?d', '?d foaf:name ?n',
+                              host='localhost', port=5672)
 
-
-def callback(body):
-    print body
-
-client.request(request, callback)
-client.start()
+for r in gen:
+    print r
