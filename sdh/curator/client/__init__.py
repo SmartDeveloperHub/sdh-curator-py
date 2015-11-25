@@ -21,10 +21,10 @@
   limitations under the License.
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=#
 """
-import Queue
 import json
-from abc import abstractmethod, abstractproperty, ABCMeta
+from abc import abstractproperty, ABCMeta
 from urlparse import urlparse
+
 from pika.exceptions import ChannelClosed
 
 __author__ = 'Fernando Serena'
@@ -36,7 +36,6 @@ import logging
 import pika
 from rdflib import Graph, RDF, Literal, BNode, URIRef
 from rdflib.namespace import Namespace, FOAF, XSD
-import re
 from agora.client.agora import Agora
 import time
 from threading import Thread
@@ -48,11 +47,8 @@ CURATOR = Namespace('http://www.smartdeveloperhub.org/vocabulary/curator#')
 TYPES = Namespace('http://www.smartdeveloperhub.org/vocabulary/types#')
 AMQP = Namespace('http://www.smartdeveloperhub.org/vocabulary/amqp#')
 
-agora_client = Agora('http://localhost:9001')
-prefixes = agora_client.prefixes
 
 class RequestGraph(Graph):
-
     __metaclass__ = ABCMeta
 
     def __init__(self):
@@ -184,15 +180,13 @@ class RequestGraph(Graph):
 
 
 class FragmentRequestGraph(RequestGraph):
-
     __metaclass__ = ABCMeta
 
     @staticmethod
     def __is_variable(elm):
         return elm.startswith('?')
 
-    @staticmethod
-    def __extend_uri(short):
+    def __extend_uri(self, short):
         """
         Extend a prefixed uri with the help of a specific dictionary of prefixes
         :param short: Prefixed uri to be extended
@@ -200,27 +194,30 @@ class FragmentRequestGraph(RequestGraph):
         """
         if short == 'a':
             return RDF.type
-        for prefix in sorted(prefixes, key=lambda x: len(x), reverse=True):
+        for prefix in sorted(self.__prefixes, key=lambda x: len(x), reverse=True):
             if short.startswith(prefix):
-                return URIRef(short.replace(prefix + ':', prefixes[prefix]))
+                return URIRef(short.replace(prefix + ':', self.__prefixes[prefix]))
         return short
 
-    @staticmethod
-    def is_uri(uri):
+    def is_uri(self, uri):
         if uri.startswith('<') and uri.endswith('>'):
             uri = uri.lstrip('<').rstrip('>')
             parse = urlparse(uri, allow_fragments=True)
             return bool(len(parse.scheme))
         elif ':' in uri:
             prefix_parts = uri.split(':')
-            return len(prefix_parts) == 2 and prefix_parts[0] in prefixes
+            return len(prefix_parts) == 2 and prefix_parts[0] in self.__prefixes
 
         return uri == 'a'
 
-    def __init__(self, *args):
+    def __init__(self, *args, **kwargs):
         super(FragmentRequestGraph, self).__init__()
         if not args:
             raise AttributeError('A graph pattern must be provided')
+
+        self.__prefixes = kwargs.get('prefixes', None)
+        if self.__prefixes is None:
+            raise AttributeError('A prefixes list must be provided')
 
         elements = {}
 
@@ -248,8 +245,8 @@ class FragmentRequestGraph(RequestGraph):
 
 
 class StreamRequestGraph(FragmentRequestGraph):
-    def __init__(self, *args):
-        super(StreamRequestGraph, self).__init__(*args)
+    def __init__(self, *args, **kwargs):
+        super(StreamRequestGraph, self).__init__(*args, **kwargs)
         self.add((self.request_node, RDF.type, CURATOR.StreamRequest))
 
     @property
@@ -259,7 +256,7 @@ class StreamRequestGraph(FragmentRequestGraph):
     def transform(self, quad):
         def __transform(x):
             if type(x) == str or type(x) == unicode:
-                if StreamRequestGraph.is_uri(x):
+                if self.is_uri(x):
                     return URIRef(x.lstrip('<').rstrip('>'))
                 else:
                     value, ty = tuple(x.split('^^'))
@@ -271,8 +268,8 @@ class StreamRequestGraph(FragmentRequestGraph):
 
 
 class QueryRequestGraph(FragmentRequestGraph):
-    def __init__(self, *args):
-        super(QueryRequestGraph, self).__init__(*args)
+    def __init__(self, *args, **kwargs):
+        super(QueryRequestGraph, self).__init__(*args, **kwargs)
         self.add((self.request_node, RDF.type, CURATOR.QueryRequest))
 
     @property
@@ -281,10 +278,10 @@ class QueryRequestGraph(FragmentRequestGraph):
 
 
 class CuratorClient(object):
-    def __init__(self, host='localhost', port=5672, wait=False, monitoring=None):
-        self.__host = host
-        self.__port = port
-        self.__connection = pika.BlockingConnection(pika.ConnectionParameters(host=host, port=port))
+    def __init__(self, broker_host='localhost', broker_port=5672, wait=False, monitoring=None, agora_host='localhost',
+                 agora_port=5002):
+        self.agora = Agora('{}:{}'.format(agora_host, agora_port))
+        self.__connection = pika.BlockingConnection(pika.ConnectionParameters(host=broker_host, port=broker_port))
         self.__channel = self.__connection.channel()
         self.__listening = False
         self.__accept_queue = self.__response_queue = None
@@ -316,7 +313,7 @@ class CuratorClient(object):
                                      routing_key='curator.request.{}'.format(self.__message.type),
                                      body=message.serialize(format='turtle'))
         self.__listening = True
-        return agora_client.prefixes, self.__consume()
+        return self.agora.prefixes, self.__consume()
 
     def __consume(self):
         def __response_callback(properties, body):
@@ -387,10 +384,13 @@ class CuratorClient(object):
 
 def get_fragment_generator(*args, **kwargs):
     client = CuratorClient(**kwargs)
-    request = StreamRequestGraph(*args)
+    request = StreamRequestGraph(prefixes=client.agora.prefixes, *args)
+    request.broker_host = kwargs['broker_host']
     return client.request(request)
+
 
 def get_query_generator(*args, **kwargs):
     client = CuratorClient(**kwargs)
-    request = QueryRequestGraph(*args)
+    request = QueryRequestGraph(prefixes=client.agora.prefixes, *args)
+    request.broker_host = kwargs['broker_host']
     return client.request(request)
