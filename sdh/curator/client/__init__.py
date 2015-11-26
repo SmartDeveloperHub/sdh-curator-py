@@ -258,9 +258,11 @@ class StreamRequestGraph(FragmentRequestGraph):
             if type(x) == str or type(x) == unicode:
                 if self.is_uri(x):
                     return URIRef(x.lstrip('<').rstrip('>'))
-                else:
-                    value, ty = tuple(x.split('^^'))
+                elif '^^' in x:
+                    (value, ty) = tuple(x.split('^^'))
                     return Literal(value.replace('"', ''), datatype=URIRef(ty.lstrip('<').rstrip('>')))
+                else:
+                    return Literal(x.replace('"', ''), datatype=XSD.string)
             return x
 
         triple = quad[1:]
