@@ -281,8 +281,8 @@ class QueryRequestGraph(FragmentRequestGraph):
 
 class CuratorClient(object):
     def __init__(self, broker_host='localhost', broker_port=5672, wait=False, monitoring=None, agora_host='localhost',
-                 agora_port=5002):
-        self.agora = Agora('{}:{}'.format(agora_host, agora_port))
+                 agora_port=5002, stop_event=None):
+        self.agora = Agora(host=agora_host, port=agora_port)
         self.__connection = pika.BlockingConnection(pika.ConnectionParameters(host=broker_host, port=broker_port))
         self.__channel = self.__connection.channel()
         self.__listening = False
@@ -293,8 +293,10 @@ class CuratorClient(object):
         self.__accepted = False
         self.__message = None
         self.__wait = wait
+        self.__stop_event = stop_event
 
     def __monitor_consume(self, t):
+        log.debug('Curator client monitor started...')
         while self.__keep_monitoring:
             if (datetime.now() - self.__last_consume).seconds > t:
                 self.stop()
@@ -333,40 +335,44 @@ class CuratorClient(object):
                 for item in items:
                     yield properties.headers, item
 
-        try:
-            for message in self.__channel.consume(self.__accept_queue, no_ack=True, inactivity_timeout=1):
-                if message is not None:
-                    method, properties, body = message
-                    g = Graph()
-                    g.parse(StringIO.StringIO(body), format='turtle')
-                    print g.serialize(format='turtle')
-                    if len(list(g.subjects(RDF.type, CURATOR.Accepted))) == 1:
-                        print 'Request accepted!'
-                        self.__accepted = True
-                    else:
-                        print 'Bad request!'
-                    self.__channel.queue_delete(self.__accept_queue)
-                    self.__channel.cancel()
-                    break
-
-            if not self.__accepted:
-                return
-            if self.__monitor is not None:
-                self.__monitor.start()
-            for message in self.__channel.consume(self.__response_queue, no_ack=True, inactivity_timeout=1):
-                if message is not None:
-                    method, properties, body = message
-                    for headers, item in __response_callback(properties, body):
-                        yield headers, self.__message.transform(item)
-                elif not self.__wait:
-                    yield None
+        for message in self.__channel.consume(self.__accept_queue, no_ack=True, inactivity_timeout=1):
+            if message is not None:
+                method, properties, body = message
+                g = Graph()
+                g.parse(StringIO.StringIO(body), format='turtle')
+                if len(list(g.subjects(RDF.type, CURATOR.Accepted))) == 1:
+                    log.info('Request accepted!')
+                    self.__accepted = True
                 else:
-                    log.debug('Inactivity timeout...')
-                self.__last_consume = datetime.now()
-        except Exception, e:
-            print e.message
+                    log.error('Bad request!')
+                self.__channel.queue_delete(self.__accept_queue)
+                self.__channel.cancel()
+                break
+            elif self.__stop_event is not None:
+                if self.__stop_event.isSet():
+                    self.stop()
+        if not self.__accepted:
+            log.debug('Request not accepted. Aborting...')
+            raise StopIteration()
+        if self.__monitor is not None:
+            self.__monitor.start()
+        for message in self.__channel.consume(self.__response_queue, no_ack=True, inactivity_timeout=1):
+            if message is not None:
+                method, properties, body = message
+                for headers, item in __response_callback(properties, body):
+                    yield headers, self.__message.transform(item)
+            elif not self.__wait:
+                yield None
+            elif self.__stop_event is not None:
+                if self.__stop_event.isSet():
+                    self.stop()
+                    raise StopIteration()
+            else:
+                log.debug('Inactivity timeout...')
+            self.__last_consume = datetime.now()
         if self.__monitor is not None:
             self.__keep_monitoring = False
+            log.debug('Waiting for client monitor to stop...')
             self.__monitor.join()
 
     def stop(self):
@@ -378,6 +384,7 @@ class CuratorClient(object):
             self.__listening = False
         except ChannelClosed:
             pass
+        log.debug('Stopped curator client!')
 
     @property
     def listening(self):

@@ -28,7 +28,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="sdh-curator-py",
-    version="0.1.0-alpha2",
+    version="0.1.0",
     author="Fernando Serena",
     author_email="fernando.serena@centeropenmiddleware.com",
     description="Python-based client to interact with the SDH Curator service",
