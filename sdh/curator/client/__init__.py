@@ -261,6 +261,8 @@ class StreamRequestGraph(FragmentRequestGraph):
                 elif '^^' in x:
                     (value, ty) = tuple(x.split('^^'))
                     return Literal(value.replace('"', ''), datatype=URIRef(ty.lstrip('<').rstrip('>')))
+                elif x.startswith('_:'):
+                    return BNode(x.replace('_:', ''))
                 else:
                     return Literal(x.replace('"', ''), datatype=XSD.string)
             return x
@@ -316,6 +318,8 @@ class CuratorClient(object):
         self.__channel.basic_publish(exchange='sdh',
                                      routing_key='curator.request.{}'.format(self.__message.type),
                                      body=message.serialize(format='turtle'))
+        log.info('sent {} request!'.format(self.__message.type))
+
         self.__listening = True
         return self.agora.prefixes, self.__consume()
 
@@ -335,6 +339,7 @@ class CuratorClient(object):
                 for item in items:
                     yield properties.headers, item
 
+        log.debug('Waiting for acceptance...')
         for message in self.__channel.consume(self.__accept_queue, no_ack=True, inactivity_timeout=1):
             if message is not None:
                 method, properties, body = message
@@ -356,6 +361,7 @@ class CuratorClient(object):
             raise StopIteration()
         if self.__monitor is not None:
             self.__monitor.start()
+        log.debug('Listening...')
         for message in self.__channel.consume(self.__response_queue, no_ack=True, inactivity_timeout=1):
             if message is not None:
                 method, properties, body = message
