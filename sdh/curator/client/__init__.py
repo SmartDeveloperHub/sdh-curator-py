@@ -36,7 +36,7 @@ import logging
 import pika
 from rdflib import Graph, RDF, Literal, BNode, URIRef
 from rdflib.namespace import Namespace, FOAF, XSD
-from agora.client.agora import Agora
+from agora.client.wrapper import Agora
 import time
 from threading import Thread
 from datetime import datetime
